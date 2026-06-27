@@ -14,7 +14,9 @@
 //! (toolchain resolution is v3 pitfall #4's own G4 exam). The rule `.bzl`'s own `load()`s are not yet threaded
 //! into `evaluate_rule` (self-contained rule `.bzl`s only).
 
-use razel_bzl_api::{ActionTemplate, BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain};
+use razel_bzl_api::{
+    encode_provider_instance, ActionTemplate, BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain,
+};
 use razel_toolchain::{ResolvedToolchainValue, ToolchainContextKey};
 use razel_core::{Digest, Error, Key, KindId, NodeKey, Value, ValuePolicy};
 use razel_engine_api::{ComputeResult, Demand, DemandContext, DemandEngine, NodeFunction};
@@ -159,55 +161,14 @@ impl Value for ConfiguredTarget {
 fn encode_providers(ps: &[ProviderInstance]) -> Vec<u8> {
     // Lead with the provider COUNT so the providers block is self-delimiting — otherwise, when this is followed by
     // the action block in ConfiguredTarget::content_digest, the providers↔actions boundary is unanchored and a
-    // provider field could in principle bleed into the action count (a #1-class collision).
+    // provider field could in principle bleed into the action count (a #1-class collision). Each provider is
+    // encoded by the canonical razel-bzl-api codec (the single source of truth — no local BzlValue encoder).
     let mut b = Vec::new();
     b.extend_from_slice(&(ps.len() as u64).to_be_bytes());
     for p in ps {
-        enc_str(&mut b, &p.provider.0);
-        b.extend_from_slice(&(p.fields.len() as u64).to_be_bytes());
-        for (n, v) in &p.fields {
-            enc_str(&mut b, n);
-            encode_bzl(v, &mut b);
-        }
+        encode_provider_instance(p, &mut b);
     }
     b
-}
-fn encode_bzl(v: &BzlValue, b: &mut Vec<u8>) {
-    match v {
-        BzlValue::None => b.push(0),
-        BzlValue::Bool(x) => {
-            b.push(1);
-            b.push(*x as u8);
-        }
-        BzlValue::Int(i) => {
-            b.push(2);
-            b.extend_from_slice(&i.to_be_bytes());
-        }
-        BzlValue::Str(s) => {
-            b.push(3);
-            enc_str(b, s);
-        }
-        BzlValue::List(items) => {
-            b.push(4);
-            b.extend_from_slice(&(items.len() as u64).to_be_bytes());
-            for it in items {
-                encode_bzl(it, b);
-            }
-        }
-        BzlValue::Rule(rd) => {
-            b.push(5);
-            enc_str(b, &rd.bzl);
-            enc_str(b, &rd.name);
-        }
-        BzlValue::Provider(pd) => {
-            b.push(6);
-            enc_str(b, &pd.id);
-            b.extend_from_slice(&(pd.fields.len() as u64).to_be_bytes());
-            for f in &pd.fields {
-                enc_str(b, f);
-            }
-        }
-    }
 }
 
 /// Resolve a dependency label string to a `CONFIGURED_TARGET` key, threading the PARENT's configuration into
