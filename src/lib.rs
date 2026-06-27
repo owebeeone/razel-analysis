@@ -342,10 +342,11 @@ impl NodeFunction for ConfiguredTargetFn {
             Err(e) => return ComputeResult::Error(Error::Invalid { what: "read rule .bzl".into(), detail: format!("{e:?}") }),
         };
 
-        // (7) run the rule impl → providers.
+        // (7) run the rule impl → providers (+ actions, consumed by the execution phase #5 — ignored for now).
+        // Toolchains are empty until phase #4 resolves them (the slot is reserved in the seam).
         let label = format!("//{}:{}", ctk.package, ctk.name);
-        match self.eval.evaluate_rule(&source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers) {
-            Ok(providers) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers })),
+        match self.eval.evaluate_rule(&source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, &[]) {
+            Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers: result.providers })),
             Err(e) => ComputeResult::Error(Error::Invalid { what: "rule evaluation".into(), detail: format!("{e:?}") }),
         }
     }
