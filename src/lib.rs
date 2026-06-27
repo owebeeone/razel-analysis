@@ -14,7 +14,7 @@
 //! (toolchain resolution is v3 pitfall #4's own G4 exam). The rule `.bzl`'s own `load()`s are not yet threaded
 //! into `evaluate_rule` (self-contained rule `.bzl`s only).
 
-use razel_bzl_api::{BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain};
+use razel_bzl_api::{ActionTemplate, BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain};
 use razel_toolchain::{ResolvedToolchainValue, ToolchainContextKey};
 use razel_core::{Digest, Error, Key, KindId, NodeKey, Value, ValuePolicy};
 use razel_engine_api::{ComputeResult, Demand, DemandContext, DemandEngine, NodeFunction};
@@ -114,11 +114,12 @@ fn decode_ct_key(bytes: &[u8]) -> Result<ConfiguredTargetKey, Error> {
     Ok(ConfiguredTargetKey { package, name, configuration, exec_platform, rule_transition })
 }
 
-/// `CONFIGURED_TARGET` value: the providers the rule published. Plain, `comparable` (canonical order from the
-/// seam → early cutoff), `serializable`. (Action templates are not here yet — that's the execution phase.)
+/// `CONFIGURED_TARGET` value: the providers the rule published + the action templates it declared (consumed by
+/// the execution phase). Plain, `comparable` (canonical order from the seam → early cutoff), `serializable`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ConfiguredTarget {
     pub providers: Vec<ProviderInstance>,
+    pub actions: Vec<ActionTemplate>,
 }
 impl ConfiguredTarget {
     pub fn provider(&self, id: &str) -> Option<&ProviderInstance> {
@@ -133,7 +134,23 @@ impl Value for ConfiguredTarget {
         other.as_any().downcast_ref::<ConfiguredTarget>().is_some_and(|o| o == self)
     }
     fn content_digest(&self) -> Digest {
-        Digest::of(&encode_providers(&self.providers))
+        let mut b = encode_providers(&self.providers);
+        b.extend_from_slice(&(self.actions.len() as u64).to_be_bytes());
+        for a in &self.actions {
+            enc_str(&mut b, &a.mnemonic);
+            for list in [&a.argv, &a.inputs, &a.outputs] {
+                b.extend_from_slice(&(list.len() as u64).to_be_bytes());
+                for s in list {
+                    enc_str(&mut b, s);
+                }
+            }
+            b.extend_from_slice(&(a.env.len() as u64).to_be_bytes());
+            for (k, v) in &a.env {
+                enc_str(&mut b, k);
+                enc_str(&mut b, v);
+            }
+        }
+        Digest::of(&b)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -370,7 +387,7 @@ impl NodeFunction for ConfiguredTargetFn {
         let tc_arg: &[ResolvedToolchain] = if cfg!(feature = "mutant_ct_drops_toolchains") { &[] } else { &toolchains };
         let label = format!("//{}:{}", ctk.package, ctk.name);
         match self.eval.evaluate_rule(&source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, tc_arg) {
-            Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers: result.providers })),
+            Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers: result.providers, actions: result.actions })),
             Err(e) => ComputeResult::Error(Error::Invalid { what: "rule evaluation".into(), detail: format!("{e:?}") }),
         }
     }
