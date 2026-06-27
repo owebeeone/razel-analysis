@@ -157,7 +157,11 @@ impl Value for ConfiguredTarget {
     }
 }
 fn encode_providers(ps: &[ProviderInstance]) -> Vec<u8> {
+    // Lead with the provider COUNT so the providers block is self-delimiting — otherwise, when this is followed by
+    // the action block in ConfiguredTarget::content_digest, the providers↔actions boundary is unanchored and a
+    // provider field could in principle bleed into the action count (a #1-class collision).
     let mut b = Vec::new();
+    b.extend_from_slice(&(ps.len() as u64).to_be_bytes());
     for p in ps {
         enc_str(&mut b, &p.provider.0);
         b.extend_from_slice(&(p.fields.len() as u64).to_be_bytes());
@@ -348,23 +352,41 @@ impl NodeFunction for ConfiguredTargetFn {
             }
         }
 
-        // (5b) resolve the rule's required toolchains for the target platform (the CONFIGURATION key dimension —
-        // None → an empty platform name, which resolves fail-closed unless a "" platform is registered). Each is
-        // a TOOLCHAIN_CONTEXT(platform, type) node (restart-driven), threaded into evaluate_rule as ctx.toolchains.
-        let platform = ctk.configuration.clone().unwrap_or_default();
-        let tc_keys: Vec<NodeKey> = required_toolchains
-            .iter()
-            .map(|ty| NodeKey::from_key(&ToolchainContextKey { target_platform: platform.clone(), toolchain_type: ty.clone() }))
-            .collect();
-        let tc_demands = ctx.request_group(&tc_keys);
+        // (5b) resolve the rule's required toolchains for the target platform (the CONFIGURATION key dimension).
+        // Each is a TOOLCHAIN_CONTEXT(platform, type) node (restart-driven), threaded into evaluate_rule as
+        // ctx.toolchains. FAIL-CLOSED: a toolchain-requiring target with no configuration cannot be resolved —
+        // error rather than coerce a missing config to a default platform name (that would be an Absorb, with
+        // fail-closedness delegated to the accident that no "" platform happens to be registered). A target that
+        // requires no toolchains skips this entirely (its configuration may legitimately be None in v1).
         let mut toolchains: Vec<ResolvedToolchain> = Vec::new();
-        for (i, d) in tc_demands.into_iter().enumerate() {
-            match d {
-                Demand::Missing => missing.push(tc_keys[i].clone()),
-                Demand::Ready(v) => match v.as_any().downcast_ref::<ResolvedToolchainValue>() {
-                    Some(rt) => toolchains.push(ResolvedToolchain { toolchain_type: required_toolchains[i].clone(), info: rt.info.clone() }),
-                    None => return ComputeResult::Error(Error::Invalid { what: "TOOLCHAIN_CONTEXT dep".into(), detail: "not a ResolvedToolchainValue".into() }),
-                },
+        if !required_toolchains.is_empty() {
+            let platform = match &ctk.configuration {
+                Some(p) => p.clone(),
+                // MUTANT: absorb a missing configuration into the empty platform name "" (anti-corner (II) regresses).
+                None if cfg!(feature = "mutant_ct_absorbs_missing_config") => String::new(),
+                None => {
+                    return ComputeResult::Error(Error::Unsupported {
+                        what: "toolchain resolution",
+                        detail: format!(
+                            "target '{}:{}' requires toolchains {:?} but has no configuration (target platform)",
+                            ctk.package, ctk.name, required_toolchains
+                        ),
+                    })
+                }
+            };
+            let tc_keys: Vec<NodeKey> = required_toolchains
+                .iter()
+                .map(|ty| NodeKey::from_key(&ToolchainContextKey { target_platform: platform.clone(), toolchain_type: ty.clone() }))
+                .collect();
+            let tc_demands = ctx.request_group(&tc_keys);
+            for (i, d) in tc_demands.into_iter().enumerate() {
+                match d {
+                    Demand::Missing => missing.push(tc_keys[i].clone()),
+                    Demand::Ready(v) => match v.as_any().downcast_ref::<ResolvedToolchainValue>() {
+                        Some(rt) => toolchains.push(ResolvedToolchain { toolchain_type: required_toolchains[i].clone(), info: rt.info.clone() }),
+                        None => return ComputeResult::Error(Error::Invalid { what: "TOOLCHAIN_CONTEXT dep".into(), detail: "not a ResolvedToolchainValue".into() }),
+                    },
+                }
             }
         }
 

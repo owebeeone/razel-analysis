@@ -24,3 +24,6 @@ mutant_ct_drops_config = []
 mutant_ct_skips_rule_file_dep = []
 # RED-FIRST: drop the resolved toolchains when running the rule → ctx.toolchains is empty (G4 exam goes red).
 mutant_ct_drops_toolchains = []
+# RED-FIRST: absorb a missing configuration into the "" platform name → a config-less toolchain-requiring target
+# silently resolves against a default platform instead of failing closed (anti-Absorb test goes red).
+mutant_ct_absorbs_missing_config = []
