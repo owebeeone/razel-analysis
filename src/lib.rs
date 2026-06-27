@@ -14,7 +14,8 @@
 //! (toolchain resolution is v3 pitfall #4's own G4 exam). The rule `.bzl`'s own `load()`s are not yet threaded
 //! into `evaluate_rule` (self-contained rule `.bzl`s only).
 
-use razel_bzl_api::{BzlEvaluator, BzlValue, DepProviders, ProviderInstance};
+use razel_bzl_api::{BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain};
+use razel_toolchain::{ResolvedToolchainValue, ToolchainContextKey};
 use razel_core::{Digest, Error, Key, KindId, NodeKey, Value, ValuePolicy};
 use razel_engine_api::{ComputeResult, Demand, DemandContext, DemandEngine, NodeFunction};
 use razel_ids::RootRelativePath;
@@ -282,8 +283,8 @@ impl NodeFunction for ConfiguredTargetFn {
             Some(m) => &m.0,
             None => return ComputeResult::Error(Error::Invalid { what: "BZL_LOAD value".into(), detail: "not a BzlModuleValue".into() }),
         };
-        let schema = match module.get(&origin.name) {
-            Some(BzlValue::Rule(rd)) => rd.attrs.clone(),
+        let (schema, required_toolchains) = match module.get(&origin.name) {
+            Some(BzlValue::Rule(rd)) => (rd.attrs.clone(), rd.toolchains.clone()),
             _ => return ComputeResult::Error(Error::Invalid {
                 what: "rule definition".into(),
                 detail: format!("'{}' is not a rule in {}", origin.name, origin.bzl),
@@ -329,6 +330,27 @@ impl NodeFunction for ConfiguredTargetFn {
                 },
             }
         }
+
+        // (5b) resolve the rule's required toolchains for the target platform (the CONFIGURATION key dimension —
+        // None → an empty platform name, which resolves fail-closed unless a "" platform is registered). Each is
+        // a TOOLCHAIN_CONTEXT(platform, type) node (restart-driven), threaded into evaluate_rule as ctx.toolchains.
+        let platform = ctk.configuration.clone().unwrap_or_default();
+        let tc_keys: Vec<NodeKey> = required_toolchains
+            .iter()
+            .map(|ty| NodeKey::from_key(&ToolchainContextKey { target_platform: platform.clone(), toolchain_type: ty.clone() }))
+            .collect();
+        let tc_demands = ctx.request_group(&tc_keys);
+        let mut toolchains: Vec<ResolvedToolchain> = Vec::new();
+        for (i, d) in tc_demands.into_iter().enumerate() {
+            match d {
+                Demand::Missing => missing.push(tc_keys[i].clone()),
+                Demand::Ready(v) => match v.as_any().downcast_ref::<ResolvedToolchainValue>() {
+                    Some(rt) => toolchains.push(ResolvedToolchain { toolchain_type: required_toolchains[i].clone(), info: rt.info.clone() }),
+                    None => return ComputeResult::Error(Error::Invalid { what: "TOOLCHAIN_CONTEXT dep".into(), detail: "not a ResolvedToolchainValue".into() }),
+                },
+            }
+        }
+
         if !missing.is_empty() {
             return ComputeResult::Missing { recorded_dep_keys: missing };
         }
@@ -342,10 +364,12 @@ impl NodeFunction for ConfiguredTargetFn {
             Err(e) => return ComputeResult::Error(Error::Invalid { what: "read rule .bzl".into(), detail: format!("{e:?}") }),
         };
 
-        // (7) run the rule impl → providers (+ actions, consumed by the execution phase #5 — ignored for now).
-        // Toolchains are empty until phase #4 resolves them (the slot is reserved in the seam).
+        // (7) run the rule impl → providers (+ actions, consumed by the execution phase #5 — ignored for now),
+        // with the resolved toolchains threaded in (ctx.toolchains[type]).
+        // MUTANT: drop the resolved toolchains → ctx.toolchains is empty → a rule that reads one fails (G4 red).
+        let tc_arg: &[ResolvedToolchain] = if cfg!(feature = "mutant_ct_drops_toolchains") { &[] } else { &toolchains };
         let label = format!("//{}:{}", ctk.package, ctk.name);
-        match self.eval.evaluate_rule(&source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, &[]) {
+        match self.eval.evaluate_rule(&source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, tc_arg) {
             Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers: result.providers })),
             Err(e) => ComputeResult::Error(Error::Invalid { what: "rule evaluation".into(), detail: format!("{e:?}") }),
         }
