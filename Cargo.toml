@@ -1,0 +1,23 @@
+[package]
+name = "razel-analysis"
+version = "0.1.0"
+edition = "2021"
+description = "razelv4 analysis node-kind: CONFIGURED_TARGET (run a rule's impl → providers, over the engine) (role: logic)."
+
+[dependencies]
+razel-core = { path = "../razel-core", version = "0.1.0" }
+razel-ids = { path = "../razel-ids", version = "0.1.0" }
+razel-engine-api = { path = "../razel-engine-api", version = "0.1.0" }
+razel-os-api = { path = "../razel-os-api", version = "0.1.0" }
+razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
+razel-source = { path = "../razel-source", version = "0.1.0" }
+razel-load = { path = "../razel-load", version = "0.1.0" }
+razel-package = { path = "../razel-package", version = "0.1.0" }
+# APIs + the loading logic + spine only — never the engine/os/starlark IMPLs (a root wires those).
+
+[features]
+# RED-FIRST: don't thread the parent's configuration into a dependency's key → the config dimension is dropped
+# from child keys (the anti-corner (III) "identity transform now" property regresses).
+mutant_ct_drops_config = []
+# RED-FIRST: drop the rule .bzl CONTENT dependency → an impl-only edit becomes invisible (stale analysis).
+mutant_ct_skips_rule_file_dep = []
