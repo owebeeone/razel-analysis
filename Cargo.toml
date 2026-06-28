@@ -3,6 +3,7 @@ name = "razel-analysis"
 version = "0.1.0"
 edition = "2021"
 description = "razelv4 analysis node-kind: CONFIGURED_TARGET (run a rule's impl → providers, over the engine) (role: logic)."
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 razel-core = { path = "../razel-core", version = "0.1.0" }
