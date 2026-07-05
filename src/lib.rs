@@ -17,10 +17,10 @@
 use razel_bzl_api::{
     encode_provider_instance, ActionTemplate, BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain,
 };
-use razel_toolchain::{ResolvedToolchainValue, ToolchainContextKey};
+use razel_toolchain::{ResolvedToolchainContextValue, ToolchainContextKey, ToolchainType, ToolchainTypeReq};
 use razel_core::{Digest, Error, Key, KindId, NodeKey, Value, ValuePolicy};
 use razel_engine_api::{ComputeResult, Demand, DemandContext, DemandEngine, NodeFunction};
-use razel_ids::RootRelativePath;
+use razel_ids::{ConfigId, RootRelativePath};
 use razel_load::{BzlLoadKey, BzlModuleValue};
 use razel_os_api::{HostPath, System};
 use razel_package::{Package, PackageKey};
@@ -313,41 +313,66 @@ impl NodeFunction for ConfiguredTargetFn {
             }
         }
 
-        // (5b) resolve the rule's required toolchains for the target platform (the CONFIGURATION key dimension).
-        // Each is a TOOLCHAIN_CONTEXT(platform, type) node (restart-driven), threaded into evaluate_rule as
-        // ctx.toolchains. FAIL-CLOSED: a toolchain-requiring target with no configuration cannot be resolved —
-        // error rather than coerce a missing config to a default platform name (that would be an Absorb, with
-        // fail-closedness delegated to the accident that no "" platform happens to be registered). A target that
-        // requires no toolchains skips this entirely (its configuration may legitimately be None in v1).
+        // (5b) resolve the rule's required toolchains via ONE TOOLCHAIN_CONTEXT node carrying the FULL
+        // required type-set (all mandatory in v1 — `rule(toolchains=[…])` has no optional marker yet),
+        // keyed by the target's CONFIGURATION (the ADR-0010 lockdown: the target platform is DERIVED from
+        // the configuration inside the toolchain node, never passed as a platform-string key). Restart-
+        // driven; the resolved map is threaded into evaluate_rule as ctx.toolchains. FAIL-CLOSED: a
+        // toolchain-requiring target with no configuration cannot be resolved — error rather than coerce a
+        // missing config to a default (that would be an Absorb). A target that requires no toolchains skips
+        // this entirely (its configuration may legitimately be None in v1).
         let mut toolchains: Vec<ResolvedToolchain> = Vec::new();
         if !required_toolchains.is_empty() {
-            let platform = match &ctk.configuration {
-                Some(p) => p.clone(),
-                // MUTANT: absorb a missing configuration into the empty platform name "" (anti-corner (II) regresses).
-                None if cfg!(feature = "mutant_ct_absorbs_missing_config") => String::new(),
+            let configuration = match &ctk.configuration {
+                Some(c) => ConfigId(c.clone()),
+                // MUTANT: absorb a missing configuration into the empty ConfigId "" (anti-corner (II) regresses).
+                None if cfg!(feature = "mutant_ct_absorbs_missing_config") => ConfigId(String::new()),
                 None => {
                     return ComputeResult::Error(Error::Unsupported {
                         what: "toolchain resolution",
                         detail: format!(
-                            "target '{}:{}' requires toolchains {:?} but has no configuration (target platform)",
+                            "target '{}:{}' requires toolchains {:?} but has no configuration",
                             ctk.package, ctk.name, required_toolchains
                         ),
                     })
                 }
             };
-            let tc_keys: Vec<NodeKey> = required_toolchains
-                .iter()
-                .map(|ty| NodeKey::from_key(&ToolchainContextKey { target_platform: platform.clone(), toolchain_type: ty.clone() }))
-                .collect();
-            let tc_demands = ctx.request_group(&tc_keys);
-            for (i, d) in tc_demands.into_iter().enumerate() {
-                match d {
-                    Demand::Missing => missing.push(tc_keys[i].clone()),
-                    Demand::Ready(v) => match v.as_any().downcast_ref::<ResolvedToolchainValue>() {
-                        Some(rt) => toolchains.push(ResolvedToolchain { toolchain_type: required_toolchains[i].clone(), info: rt.info.clone() }),
-                        None => return ComputeResult::Error(Error::Invalid { what: "TOOLCHAIN_CONTEXT dep".into(), detail: "not a ResolvedToolchainValue".into() }),
-                    },
-                }
+            let tc_key = NodeKey::from_key(&ToolchainContextKey::new(
+                configuration,
+                required_toolchains
+                    .iter()
+                    .map(|ty| ToolchainTypeReq { toolchain_type: ToolchainType(ty.clone()), mandatory: true })
+                    .collect(),
+                Vec::new(), // exec constraints: none in v1 (rule exec_compatible_with is deferred)
+                None,       // force_exec_platform: the fixed v1 sentinel
+                false,      // debug_target: false in v1
+            ));
+            match ctx.request(&tc_key) {
+                Demand::Missing => missing.push(tc_key),
+                Demand::Ready(v) => match v.as_any().downcast_ref::<ResolvedToolchainContextValue>() {
+                    Some(rctx) => {
+                        for ty in &required_toolchains {
+                            match rctx.type_to_resolved.get(&ToolchainType(ty.clone())) {
+                                Some(info) => toolchains
+                                    .push(ResolvedToolchain { toolchain_type: ty.clone(), info: info.clone() }),
+                                // Mandatory ⇒ present (the toolchain node fails closed upstream); a hole here
+                                // is a broken invariant — typed error, never an empty ctx.toolchains slot.
+                                None => {
+                                    return ComputeResult::Error(Error::Invalid {
+                                        what: "TOOLCHAIN_CONTEXT value".into(),
+                                        detail: format!("mandatory toolchain type '{ty}' absent from the resolved context"),
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        return ComputeResult::Error(Error::Invalid {
+                            what: "TOOLCHAIN_CONTEXT dep".into(),
+                            detail: "not a ResolvedToolchainContextValue".into(),
+                        })
+                    }
+                },
             }
         }
 
