@@ -15,7 +15,8 @@
 //! into `evaluate_rule` (self-contained rule `.bzl`s only).
 
 use razel_bzl_api::{
-    encode_provider_instance, ActionTemplate, BzlEvaluator, BzlValue, DepProviders, ProviderInstance, ResolvedToolchain,
+    encode_provider_instance, ActionTemplate, BzlEvaluator, BzlValue, DepProviders, EvalEnv, ProviderId,
+    ProviderInstance, ResolvedToolchain,
 };
 use razel_toolchain::{ResolvedToolchainContextValue, ToolchainContextKey, ToolchainType, ToolchainTypeReq};
 use razel_core::{Digest, Error, Key, KindId, NodeKey, Value, ValuePolicy};
@@ -124,8 +125,10 @@ pub struct ConfiguredTarget {
     pub actions: Vec<ActionTemplate>,
 }
 impl ConfiguredTarget {
-    pub fn provider(&self, id: &str) -> Option<&ProviderInstance> {
-        self.providers.iter().find(|p| p.provider.0 == id)
+    /// Provider lookup on the ONE identity funnel (lockdown C2): keyed by `ProviderId`'s derived `Eq` —
+    /// never a raw name comparison (a bzl-differing identity is a DIFFERENT provider).
+    pub fn provider(&self, id: &ProviderId) -> Option<&ProviderInstance> {
+        self.providers.iter().find(|p| &p.provider == id)
     }
 }
 impl Value for ConfiguredTarget {
@@ -255,8 +258,13 @@ impl NodeFunction for ConfiguredTargetFn {
             }
         }
 
-        // (3b) the rule's attribute schema (to identify label-typed deps) via BZL_LOAD of its .bzl.
-        let bzl_key = NodeKey::from_key(&BzlLoadKey(RootRelativePath(origin.bzl.clone())));
+        // (3b) the rule's attribute schema (to identify label-typed deps) via BZL_LOAD of its .bzl —
+        // requested under the SAME row-1 contract key the loading phase uses (Build{is_prelude:false},
+        // v1 semantics row, evaluator-served env id), so the module node is shared, never re-keyed.
+        let bzl_key = match BzlLoadKey::v1(RootRelativePath(origin.bzl.clone()), self.eval.as_ref()) {
+            Ok(k) => NodeKey::from_key(&k),
+            Err(e) => return ComputeResult::Error(e),
+        };
         let bm = match ctx.request(&bzl_key) {
             Demand::Missing => return ComputeResult::Missing { recorded_dep_keys: vec![bzl_key] },
             Demand::Ready(v) => v,
@@ -394,7 +402,9 @@ impl NodeFunction for ConfiguredTargetFn {
         // MUTANT: drop the resolved toolchains → ctx.toolchains is empty → a rule that reads one fails (G4 red).
         let tc_arg: &[ResolvedToolchain] = if cfg!(feature = "mutant_ct_drops_toolchains") { &[] } else { &toolchains };
         let label = format!("//{}:{}", ctk.package, ctk.name);
-        match self.eval.evaluate_rule(&source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, tc_arg) {
+        // The analysis re-eval runs in the SAME row-1 env the rule's .bzl was loaded in (phase-env §3).
+        let env = EvalEnv::build_bzl_v1();
+        match self.eval.evaluate_rule(&env, &source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, tc_arg) {
             Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers: result.providers, actions: result.actions })),
             Err(e) => ComputeResult::Error(Error::Invalid { what: "rule evaluation".into(), detail: format!("{e:?}") }),
         }
