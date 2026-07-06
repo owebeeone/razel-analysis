@@ -107,7 +107,11 @@ impl<'a> Cur<'a> {
         }
     }
 }
-fn decode_ct_key(bytes: &[u8]) -> Result<ConfiguredTargetKey, Error> {
+/// Decode a `CONFIGURED_TARGET` key's canonical bytes — THE one decode of CT identity (the artifact-model
+/// lockdown §2 "no second channel" rule): `razel-action`'s `GeneratingActionKey`/`TargetCompletionKey`
+/// codecs delegate here rather than re-implementing the CT frame. Fail-closed: malformed input is a typed
+/// `Error::Invalid`, never a panic.
+pub fn decode_ct_key(bytes: &[u8]) -> Result<ConfiguredTargetKey, Error> {
     let mut c = Cur::new(bytes);
     let package = c.str()?;
     let name = c.str()?;
