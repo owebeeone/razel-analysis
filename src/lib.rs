@@ -121,12 +121,30 @@ pub fn decode_ct_key(bytes: &[u8]) -> Result<ConfiguredTargetKey, Error> {
     Ok(ConfiguredTargetKey { package, name, configuration, exec_platform, rule_transition })
 }
 
-/// `CONFIGURED_TARGET` value: the providers the rule published + the action templates it declared (consumed by
-/// the execution phase). Plain, `comparable` (canonical order from the seam → early cutoff), `serializable`.
+/// One declared output of a DIRECT dependency, stamped with its PRODUCING action — the per-invocation
+/// files-chaining map (`RazelV4ArtifactModelLockdown.md` §3 R3 note / decision A: "my inputs are my dep's
+/// outputs"). Built at analysis time from the deps' `{providers, actions}` (which the CT already fetched to
+/// propagate providers), it rides the CT VALUE — never a node key (the frozen ACTION/ARTIFACT keys don't
+/// reshape). The `ACTION` node's `InputResolver` consults it via the owner CT value: an action input path
+/// matching a dep output resolves to `Derived{producer_ct, action_index}` (fail-closed — anything else is a
+/// sibling output, a source, or a typed error, never absorbed).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DepOutput {
+    pub exec_path: String,
+    pub producer_ct: ConfiguredTargetKey,
+    pub action_index: u32,
+}
+
+/// `CONFIGURED_TARGET` value: the providers the rule published + the action templates it declared + the
+/// files-chaining map of its DIRECT deps' outputs (all consumed by the execution phase). Plain, `comparable`
+/// (canonical order from the seam → early cutoff), `serializable`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ConfiguredTarget {
     pub providers: Vec<ProviderInstance>,
     pub actions: Vec<ActionTemplate>,
+    /// The DIRECT-dep output → producing-action chaining map (see [`DepOutput`]). Empty for a leaf target
+    /// (no deps) or a target whose deps declare no outputs.
+    pub dep_outputs: Vec<DepOutput>,
 }
 impl ConfiguredTarget {
     /// Provider lookup on the ONE identity funnel (lockdown C2): keyed by `ProviderId`'s derived `Eq` —
@@ -158,6 +176,18 @@ impl Value for ConfiguredTarget {
                 enc_str(&mut b, k);
                 enc_str(&mut b, v);
             }
+        }
+        // The files-chaining map, APPENDED after the (frozen-boundary) actions block: a self-delimiting
+        // count-anchored run of (exec_path, length-framed producer CT key, action index). A dep-output edit
+        // that changes the producing action is thus a value + digest change (and a `value_eq` change → the
+        // dependent action re-runs). Empty for a leaf → byte-identical to the pre-chaining digest.
+        b.extend_from_slice(&(self.dep_outputs.len() as u64).to_be_bytes());
+        for d in &self.dep_outputs {
+            enc_str(&mut b, &d.exec_path);
+            let ct = d.producer_ct.encode();
+            b.extend_from_slice(&(ct.len() as u64).to_be_bytes());
+            b.extend_from_slice(&ct);
+            b.extend_from_slice(&d.action_index.to_be_bytes());
         }
         Digest::of(&b)
     }
@@ -311,15 +341,53 @@ impl NodeFunction for ConfiguredTargetFn {
             }
         }
 
-        // (5) request the dep configured-targets (restart-driven) and collect their providers.
+        // (5) request the dep configured-targets (restart-driven) and collect their providers AND their
+        // declared outputs (the files-chaining map: each dep output → its producing action). The dep CT
+        // value already carries {providers, actions}; the same fetch feeds both.
         let demands = ctx.request_group(&dep_keys);
         let mut missing: Vec<NodeKey> = Vec::new();
         let mut dep_providers: Vec<DepProviders> = Vec::new();
+        let mut dep_outputs: Vec<DepOutput> = Vec::new();
         for (i, d) in demands.into_iter().enumerate() {
             match d {
                 Demand::Missing => missing.push(dep_keys[i].clone()),
                 Demand::Ready(v) => match v.as_any().downcast_ref::<ConfiguredTarget>() {
-                    Some(ct) => dep_providers.push(DepProviders { label: dep_labels[i].clone(), providers: ct.providers.clone() }),
+                    Some(ct) => {
+                        dep_providers.push(DepProviders { label: dep_labels[i].clone(), providers: ct.providers.clone() });
+                        // files-chaining (MUTANT `mutant_chain_drops_dep_files` drops the whole map → a dep's
+                        // declared output named as a dependent action input can no longer resolve to its
+                        // producer; it falls through to Source, the file is absent on disk, and the build
+                        // fails closed — the granular re-run edge is also severed). The dep CT key is the one
+                        // we requested (decode is total on our own encode); a duplicate exec-path from two
+                        // DISTINCT producers is a typed Conflict (fail-closed, never a silent first-wins).
+                        if !cfg!(feature = "mutant_chain_drops_dep_files") {
+                            let dep_ct_key = match decode_ct_key(dep_keys[i].canonical()) {
+                                Ok(k) => k,
+                                Err(e) => return ComputeResult::Error(e),
+                            };
+                            for (idx, tmpl) in ct.actions.iter().enumerate() {
+                                for out in &tmpl.outputs {
+                                    if let Some(prev) = dep_outputs.iter().find(|d| &d.exec_path == out) {
+                                        if prev.producer_ct != dep_ct_key || prev.action_index != idx as u32 {
+                                            return ComputeResult::Error(Error::Conflict {
+                                                what: "duplicate dep output".into(),
+                                                detail: format!(
+                                                    "//{}:{}: dep output '{}' is produced by two distinct dependencies",
+                                                    ctk.package, ctk.name, out
+                                                ),
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                    dep_outputs.push(DepOutput {
+                                        exec_path: out.clone(),
+                                        producer_ct: dep_ct_key.clone(),
+                                        action_index: idx as u32,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     None => return ComputeResult::Error(Error::Invalid { what: "CONFIGURED_TARGET dep".into(), detail: "not a ConfiguredTarget".into() }),
                 },
             }
@@ -409,7 +477,11 @@ impl NodeFunction for ConfiguredTargetFn {
         // The analysis re-eval runs in the SAME row-1 env the rule's .bzl was loaded in (phase-env §3).
         let env = EvalEnv::build_bzl_v1();
         match self.eval.evaluate_rule(&env, &source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, tc_arg) {
-            Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget { providers: result.providers, actions: result.actions })),
+            Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget {
+                providers: result.providers,
+                actions: result.actions,
+                dep_outputs,
+            })),
             Err(e) => ComputeResult::Error(Error::Invalid { what: "rule evaluation".into(), detail: format!("{e:?}") }),
         }
     }

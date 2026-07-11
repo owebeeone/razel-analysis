@@ -28,3 +28,9 @@ mutant_ct_drops_toolchains = []
 # RED-FIRST: absorb a missing configuration into the "" platform name → a config-less toolchain-requiring target
 # silently resolves against a default platform instead of failing closed (anti-Absorb test goes red).
 mutant_ct_absorbs_missing_config = []
+# RED-FIRST (files-chaining): drop the DIRECT-dep output → producing-action chaining map from the CT value.
+# A dependent rule's action input that names a dep's declared output (a rust_binary linking a rust_library's
+# rlib, listed from `dep[DefaultInfo].files`) can then no longer resolve to its producer — it falls through
+# to Source, the derived file is absent on disk, and the build fails closed (and the edit→re-run granularity
+# edge is severed). Turns the rust-rules chaining proof RED.
+mutant_chain_drops_dep_files = []
