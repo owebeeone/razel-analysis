@@ -34,3 +34,9 @@ mutant_ct_absorbs_missing_config = []
 # to Source, the derived file is absent on disk, and the build fails closed (and the edit→re-run granularity
 # edge is severed). Turns the rust-rules chaining proof RED.
 mutant_chain_drops_dep_files = []
+# RED-FIRST (transitive files-chaining — the self-host wave): drop the TRANSITIVE merge of each direct dep's
+# own (already-transitive) dep_outputs into the parent's map. Only DIRECT deps' outputs remain resolvable, so
+# a dep-of-dep rlib that a dependent action lists as an input (e.g. razel-wire-cbor's action naming
+# razel-core's rlib, reached transitively through razel-wire-api) falls through to Source, is absent on disk,
+# and the multi-crate self-host chain fails closed (typed NotFound). Turns the self-host chain proof RED.
+mutant_transitive_outputs_not_merged = []

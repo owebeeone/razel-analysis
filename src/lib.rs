@@ -208,6 +208,33 @@ fn encode_providers(ps: &[ProviderInstance]) -> Vec<u8> {
     b
 }
 
+/// Merge one dep-output entry into the accumulating files-chaining map with the fail-closed dedup/conflict
+/// discipline — SHARED by the DIRECT-dep-output stamp and the TRANSITIVE-closure merge. An entry whose
+/// `exec_path` is already mapped to the SAME `(producer CT, action index)` is a benign duplicate (the
+/// diamond: one producer reached by two dependency paths) and is deduped; the SAME `exec_path` from a
+/// DIFFERENT producer is a typed [`Error::Conflict`] (two distinct dependencies claim one output path —
+/// never a silent first-wins). `owner` is only for the error message.
+fn merge_dep_output(
+    dep_outputs: &mut Vec<DepOutput>,
+    entry: DepOutput,
+    owner: &ConfiguredTargetKey,
+) -> Result<(), Error> {
+    if let Some(prev) = dep_outputs.iter().find(|d| d.exec_path == entry.exec_path) {
+        if prev.producer_ct != entry.producer_ct || prev.action_index != entry.action_index {
+            return Err(Error::Conflict {
+                what: "duplicate dep output".into(),
+                detail: format!(
+                    "//{}:{}: dep output '{}' is produced by two distinct dependencies",
+                    owner.package, owner.name, entry.exec_path
+                ),
+            });
+        }
+        return Ok(()); // benign duplicate (diamond) — dedup, do not re-push.
+    }
+    dep_outputs.push(entry);
+    Ok(())
+}
+
 /// Resolve a dependency label string to a `CONFIGURED_TARGET` key, threading the PARENT's configuration into
 /// the child (an identity transform in v1 — a real rule/configuration transition slots in here later, additive).
 /// SPIKE: `":name"` (same package) and `"//pkg:name"` (absolute). Other forms fail closed (never mis-resolved).
@@ -365,25 +392,37 @@ impl NodeFunction for ConfiguredTargetFn {
                                 Ok(k) => k,
                                 Err(e) => return ComputeResult::Error(e),
                             };
+                            // (a) the dep's OWN declared action outputs → {this dep CT, action idx}.
                             for (idx, tmpl) in ct.actions.iter().enumerate() {
                                 for out in &tmpl.outputs {
-                                    if let Some(prev) = dep_outputs.iter().find(|d| &d.exec_path == out) {
-                                        if prev.producer_ct != dep_ct_key || prev.action_index != idx as u32 {
-                                            return ComputeResult::Error(Error::Conflict {
-                                                what: "duplicate dep output".into(),
-                                                detail: format!(
-                                                    "//{}:{}: dep output '{}' is produced by two distinct dependencies",
-                                                    ctk.package, ctk.name, out
-                                                ),
-                                            });
-                                        }
-                                        continue;
-                                    }
-                                    dep_outputs.push(DepOutput {
+                                    let entry = DepOutput {
                                         exec_path: out.clone(),
                                         producer_ct: dep_ct_key.clone(),
                                         action_index: idx as u32,
-                                    });
+                                    };
+                                    if let Err(e) = merge_dep_output(&mut dep_outputs, entry, &ctk) {
+                                        return ComputeResult::Error(e);
+                                    }
+                                }
+                            }
+                            // (b) the TRANSITIVE closure: merge the dep's OWN (already-transitive) dep_outputs.
+                            // Each dep CT was computed by THIS same function, so its `dep_outputs` is ITS full
+                            // transitive closure; merging every direct dep's closure gives the parent the whole
+                            // graph's producer map (values-only, same digest frame — the map rides the CT VALUE,
+                            // no key reshape). The producer_ct is carried VERBATIM: it names the TRUE producing
+                            // analysis node (a dep-of-dep), never the intermediary — so a rustc `-L`/`--extern`
+                            // input that names a dep-of-dep rlib resolves to its real generating ACTION, and a
+                            // diamond (one crate reached via two paths) dedups on identical (producer, idx)
+                            // rather than false-conflicting.
+                            // MUTANT `mutant_transitive_outputs_not_merged`: drop this merge → a dep-of-dep rlib
+                            // a dependent action lists as an input can no longer resolve to a producer; it falls
+                            // through to Source, the derived file is absent on disk, and the multi-crate chain
+                            // fails closed (typed NotFound) — the rust self-host chain proof goes RED.
+                            if !cfg!(feature = "mutant_transitive_outputs_not_merged") {
+                                for d in &ct.dep_outputs {
+                                    if let Err(e) = merge_dep_output(&mut dep_outputs, d.clone(), &ctk) {
+                                        return ComputeResult::Error(e);
+                                    }
                                 }
                             }
                         }
