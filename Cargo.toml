@@ -40,3 +40,28 @@ mutant_chain_drops_dep_files = []
 # razel-core's rlib, reached transitively through razel-wire-api) falls through to Source, is absent on disk,
 # and the multi-crate self-host chain fails closed (typed NotFound). Turns the self-host chain proof RED.
 mutant_transitive_outputs_not_merged = []
+# RED-FIRST (T17 external roots, D1 label side): drop the `@<repo>//` marker from the external package string
+# in resolve_dep, so an external package `@shape//foo` collapses to its bare pkg-rel `foo` and COLLIDES in CT
+# identity with an internal package of the same suffix. Turns
+# `external_and_internal_same_suffix_packages_are_distinct_cts` RED (the distinct-identity law).
+mutant_repo_prefix_stripped_from_package = []
+# RED-FIRST (C7 visibility, D7): skip the cross-package visibility enforcement → a private (default) target
+# consumed across a package boundary silently resolves instead of a typed analysis error naming both labels.
+# Turns the visibility guard test RED (unit + over-the-root).
+mutant_visibility_ignored = []
+# RED-FIRST (T19-P2 alias builtin): the native `alias` forwards an EMPTY provider set instead of the
+# `actual` target's providers → a dependent that reads a forwarded provider (`dep[RustInfo]` in rust.bzl)
+# through the vendored-crates hub alias can no longer find it and the build fails closed. Turns the alias
+# provider-passthrough proof (tests/rust_third_party.rs) RED. Never enable in a real build.
+mutant_alias_breaks_provider_passthrough = []
+# RED-FIRST (T20 select): a select Branch ignores condition matching and takes the FIRST dict entry's value
+# → the WRONG branch is chosen (proved by its content) regardless of which config_setting actually matched.
+# Turns the select-resolves-to-correct-branch driving proofs RED.
+mutant_select_takes_first_branch = []
+# RED-FIRST (T20 select): a select Branch prefers `//conditions:default` over any real matching condition →
+# a target that must take a specific matched branch takes the default instead. Turns the match proofs RED.
+mutant_select_default_always_wins = []
+# RED-FIRST (T20 select): a `config_setting` short-circuits its match to TRUE regardless of the resolving
+# configuration → a setting that should NOT match now does, so the ambiguity + fail-closed (no-match) proofs
+# no longer fire. Turns the config_setting matching + ambiguity proofs RED.
+mutant_config_setting_matches_all = []

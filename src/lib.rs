@@ -15,19 +15,23 @@
 //! into `evaluate_rule` (self-contained rule `.bzl`s only).
 
 use razel_bzl_api::{
-    encode_provider_instance, ActionTemplate, BzlEvaluator, BzlValue, DepProviders, EvalEnv, ProviderId,
-    ProviderInstance, ResolvedToolchain,
+    encode_provider_instance, ActionTemplate, BzlEvaluator, BzlModule, BzlValue, DepProviders, EvalEnv, LoadKind,
+    ProviderId, ProviderInstance, ResolvedToolchain,
 };
 use razel_toolchain::{ResolvedToolchainContextValue, ToolchainContextKey, ToolchainType, ToolchainTypeReq};
 use razel_core::{Digest, Error, Key, KindId, NodeKey, Value, ValuePolicy};
 use razel_engine_api::{ComputeResult, Demand, DemandContext, DemandEngine, NodeFunction};
 use razel_ids::{ConfigId, RootRelativePath};
-use razel_load::{BzlLoadKey, BzlModuleValue};
+use razel_load::{resolve_load, BzlLoadKey, BzlModuleValue};
 use razel_os_api::{HostPath, System};
 use razel_package::{Package, PackageKey};
-use razel_source::{join_root, FileKey, FileValue};
+use razel_source::{resolve_source_path, ExternalRepos, FileKey, FileValue};
 use std::any::Any;
 use std::sync::Arc;
+
+/// `select()` resolution + the native `config_setting` match computation (T20 select).
+mod select;
+pub use select::{SelectConfig, CONFIG_MATCH_INFO};
 
 pub const CONFIGURED_TARGET: KindId = KindId(40);
 
@@ -145,6 +149,10 @@ pub struct ConfiguredTarget {
     /// The DIRECT-dep output → producing-action chaining map (see [`DepOutput`]). Empty for a leaf target
     /// (no deps) or a target whose deps declare no outputs.
     pub dep_outputs: Vec<DepOutput>,
+    /// The target's `visibility` label-strings (C7, D7) — carried on the CT VALUE so a DEPENDENT can enforce
+    /// the cross-package edge (default private; `["//visibility:public"]` = visible everywhere). Empty =
+    /// private. In the digest so a visibility edit invalidates dependents (an edge that was allowed may error).
+    pub visibility: Vec<String>,
 }
 impl ConfiguredTarget {
     /// Provider lookup on the ONE identity funnel (lockdown C2): keyed by `ProviderId`'s derived `Eq` —
@@ -188,6 +196,13 @@ impl Value for ConfiguredTarget {
             b.extend_from_slice(&(ct.len() as u64).to_be_bytes());
             b.extend_from_slice(&ct);
             b.extend_from_slice(&d.action_index.to_be_bytes());
+        }
+        // Visibility (C7), appended count-anchored after the dep_outputs run: a visibility edit changes the
+        // value + digest, so a dependent whose cross-package edge's legality flips re-analyzes. Empty
+        // (private) → a self-delimiting `0` count, so a pre-C7 leaf digest widens by exactly 8 bytes.
+        b.extend_from_slice(&(self.visibility.len() as u64).to_be_bytes());
+        for v in &self.visibility {
+            enc_str(&mut b, v);
         }
         Digest::of(&b)
     }
@@ -237,9 +252,38 @@ fn merge_dep_output(
 
 /// Resolve a dependency label string to a `CONFIGURED_TARGET` key, threading the PARENT's configuration into
 /// the child (an identity transform in v1 — a real rule/configuration transition slots in here later, additive).
-/// SPIKE: `":name"` (same package) and `"//pkg:name"` (absolute). Other forms fail closed (never mis-resolved).
-fn resolve_dep(parent: &ConfiguredTargetKey, lbl: &str) -> Result<NodeKey, Error> {
-    let (package, name) = if let Some(rest) = lbl.strip_prefix("//") {
+/// Forms: `":name"` (same package), `"//pkg:name"` (absolute), and `"@repo//pkg:name"` (external repo, T17 —
+/// canonical D1 package text `@<repo>//<pkg>`, DECLARED repo resolves / UNDECLARED stays a typed error). Every
+/// other form fails closed (never mis-resolved). `repos` is the external-repo registry (empty = internal-only,
+/// so all existing internal resolutions are byte-identical).
+pub(crate) fn resolve_dep(parent: &ConfiguredTargetKey, lbl: &str, repos: &ExternalRepos) -> Result<NodeKey, Error> {
+    let (package, name) = if let Some(rest) = lbl.strip_prefix('@') {
+        // `@repo//pkg:name` — an external-repo label. Parse the canonical D1 package text `@<repo>//<pkg>`
+        // (root package → `@<repo>//`). Fail-closed for an UNDECLARED repo (never a workspace fallback).
+        let (repo, after) = match rest.split_once("//") {
+            Some((repo, after)) if !repo.is_empty() => (repo, after),
+            _ => return Err(Error::Unsupported { what: "dep label form", detail: format!("expected '@repo//pkg:name', got '{lbl}'") }),
+        };
+        let (pkg_rel, n) = match after.split_once(':') {
+            Some((p, n)) if !n.is_empty() => (p, n),
+            _ => return Err(Error::Unsupported { what: "dep label form", detail: format!("expected '@repo//pkg:name', got '{lbl}'") }),
+        };
+        if !repos.contains(repo) {
+            return Err(Error::NotFound {
+                what: "external repository".into(),
+                detail: format!("undeclared repository '@{repo}' in dep label '{lbl}' (fail-closed — no workspace fallback)"),
+            });
+        }
+        let package = if cfg!(feature = "mutant_repo_prefix_stripped_from_package") {
+            // MUTANT: drop the `@<repo>//` marker → the external package string collapses to its bare pkg-rel,
+            // colliding in CT identity with an internal package of the same suffix. Turns
+            // `external_and_internal_same_suffix_packages_are_distinct_cts` RED (the D1 distinct-identity law).
+            pkg_rel.to_string()
+        } else {
+            format!("@{repo}//{pkg_rel}")
+        };
+        (package, n.to_string())
+    } else if let Some(rest) = lbl.strip_prefix("//") {
         match rest.split_once(':') {
             Some((p, n)) if !n.is_empty() => (p.to_string(), n.to_string()),
             _ => return Err(Error::Unsupported { what: "dep label form", detail: format!("expected //pkg:name, got '{lbl}'") }),
@@ -250,7 +294,7 @@ fn resolve_dep(parent: &ConfiguredTargetKey, lbl: &str) -> Result<NodeKey, Error
         }
         (parent.package.clone(), n.to_string())
     } else {
-        return Err(Error::Unsupported { what: "dep label form", detail: format!("expected ':name' or '//pkg:name', got '{lbl}'") });
+        return Err(Error::Unsupported { what: "dep label form", detail: format!("expected ':name', '//pkg:name', or '@repo//pkg:name', got '{lbl}'") });
     };
     // MUTANT: dropping the parent's configuration here regresses anti-corner (III) (config not threaded).
     let (configuration, exec_platform, rule_transition) = if cfg!(feature = "mutant_ct_drops_config") {
@@ -261,17 +305,186 @@ fn resolve_dep(parent: &ConfiguredTargetKey, lbl: &str) -> Result<NodeKey, Error
     Ok(NodeKey::from_key(&ConfiguredTargetKey { package, name, configuration, exec_platform, rule_transition }))
 }
 
-/// `CONFIGURED_TARGET`: analyze one target — resolve its deps, then run its rule's impl → providers.
+/// Render a `(package, name)` as the ctx.label string for the rule eval. An external package already carries
+/// its `@<repo>//` prefix (canonical D1 text) → `@<repo>//<pkg>:<name>`; an internal package → `//<pkg>:<name>`.
+/// The ONE place the label-string form is produced (rust.bzl's v1 `_pkg`/`_name` parse it; C1 swaps in a Label).
+pub(crate) fn render_label(package: &str, name: &str) -> String {
+    if package.starts_with('@') {
+        format!("{package}:{name}")
+    } else {
+        format!("//{package}:{name}")
+    }
+}
+
+/// The repo a D1 exec-space path belongs to: `external/<repo>/…` → `Some(repo)`, a main-repo path → `None`.
+/// Used to scope a rule `.bzl`'s `//`-relative `load()`s to its DEFINING repo (row-3 per-repo load context)
+/// when threading its transitive load closure into `evaluate_rule`.
+fn repo_context_of(exec_path: &str) -> Option<String> {
+    exec_path.strip_prefix("external/").and_then(|rest| rest.split('/').next()).map(|s| s.to_string())
+}
+
+/// The C7 well-known visibility specs (D7 minimal cut: public/private only; groups + package labels later).
+const VISIBILITY_PUBLIC: &str = "//visibility:public";
+const VISIBILITY_PRIVATE: &str = "//visibility:private";
+
+/// Extract a target's `visibility` label-strings (C7). Absent → empty (the private default). `pub(crate)`:
+/// the `config_setting` CT (select.rs) carries the same visibility on its match-info value.
+pub(crate) fn target_visibility(target: &razel_bzl_api::TargetDecl) -> Vec<String> {
+    match target.attrs.iter().find(|(n, _)| n == "visibility").map(|(_, v)| v) {
+        Some(BzlValue::List(items)) => {
+            items.iter().filter_map(|i| if let BzlValue::Str(s) = i { Some(s.clone()) } else { None }).collect()
+        }
+        Some(BzlValue::Str(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Enforce a dependency edge's visibility (C7, D7): a SAME-package edge is always allowed; a CROSS-package
+/// edge to a `//visibility:public` target is allowed; a cross-package edge to a private (default/absent)
+/// target is a typed analysis error naming BOTH labels (Bazel's shape). Unknown visibility forms (groups /
+/// `//pkg:__pkg__`) fail closed — deferred, never silently allowed. RED under `mutant_visibility_ignored`.
+fn check_visibility(
+    parent_pkg: &str,
+    dep_pkg: &str,
+    parent_label: &str,
+    dep_label: &str,
+    dep_visibility: &[String],
+) -> Result<(), Error> {
+    // MUTANT: skip enforcement → a private cross-package dep silently resolves (the D7 hole this guards).
+    if cfg!(feature = "mutant_visibility_ignored") {
+        return Ok(());
+    }
+    if parent_pkg == dep_pkg {
+        return Ok(()); // same-package edges are always visible (Bazel)
+    }
+    let mut public = false;
+    for v in dep_visibility {
+        match v.as_str() {
+            VISIBILITY_PUBLIC => public = true,
+            VISIBILITY_PRIVATE => {}
+            other => {
+                return Err(Error::Unsupported {
+                    what: "visibility form",
+                    detail: format!("unsupported visibility '{other}' on '{dep_label}' (v1: //visibility:public|private only)"),
+                })
+            }
+        }
+    }
+    if public {
+        return Ok(());
+    }
+    Err(Error::Invalid {
+        what: "visibility".into(),
+        detail: format!(
+            "target '{dep_label}' is not visible to '{parent_label}' (default private; add visibility = [\"//visibility:public\"])"
+        ),
+    })
+}
+
+/// `CONFIGURED_TARGET`: analyze one target — resolve its selects + deps, then run its rule's impl → providers.
 pub struct ConfiguredTargetFn {
     sys: Arc<dyn System>,
     root: HostPath,
     eval: Arc<dyn BzlEvaluator>,
+    repos: ExternalRepos,
+    /// Composition-root config data for `select()` resolution (T20 select): per-configuration constraint set +
+    /// values. EMPTY by default (existing callers unchanged — a target with no selects is byte-identical, and
+    /// a select with real conditions over an empty config fails closed); the host seeds the real host config.
+    select_config: SelectConfig,
 }
 impl ConfiguredTargetFn {
     pub fn new(sys: Arc<dyn System>, root: HostPath, eval: Arc<dyn BzlEvaluator>) -> Self {
-        Self { sys, root, eval }
+        Self::new_with_repos(sys, root, eval, ExternalRepos::empty())
+    }
+    pub fn new_with_repos(sys: Arc<dyn System>, root: HostPath, eval: Arc<dyn BzlEvaluator>, repos: ExternalRepos) -> Self {
+        Self::new_with_repos_and_select(sys, root, eval, repos, SelectConfig::default())
+    }
+    pub fn new_with_repos_and_select(
+        sys: Arc<dyn System>,
+        root: HostPath,
+        eval: Arc<dyn BzlEvaluator>,
+        repos: ExternalRepos,
+        select_config: SelectConfig,
+    ) -> Self {
+        Self { sys, root, eval, repos, select_config }
+    }
+
+    /// `alias` analysis (T19-P2): forward the `actual` target's providers + dep-output chaining. The alias's
+    /// OWN visibility rides its CT value (a DEPENDENT enforces the alias edge); the alias→actual edge enforces
+    /// `actual`'s visibility here (a private cross-package `actual` is a typed error). An alias declares NO
+    /// actions of its own. LANGUAGE-AGNOSTIC — it forwards whatever providers `actual` published, so it serves
+    /// rust targets today and non-rust targets later without change.
+    fn compute_alias(
+        &self,
+        ctk: &ConfiguredTargetKey,
+        target: &razel_bzl_api::TargetDecl,
+        ctx: &mut dyn DemandContext,
+    ) -> ComputeResult {
+        // `actual` is a single label string (Bazel's alias.actual). Fail closed on any other shape.
+        let actual = match target.attrs.iter().find(|(n, _)| n == "actual").map(|(_, v)| v) {
+            Some(BzlValue::Str(s)) => s.clone(),
+            _ => {
+                return ComputeResult::Error(Error::Invalid {
+                    what: "alias 'actual'".into(),
+                    detail: format!("//{}:{} alias requires a single 'actual' label string", ctk.package, ctk.name),
+                })
+            }
+        };
+        let visibility = target_visibility(target);
+        let parent_label = render_label(&ctk.package, &ctk.name);
+        // Resolve + request the `actual` CT (restart-driven; config threaded via resolve_dep).
+        let dep_key = match resolve_dep(ctk, &actual, &self.repos) {
+            Ok(k) => k,
+            Err(e) => return ComputeResult::Error(e),
+        };
+        let dv = match ctx.request(&dep_key) {
+            Demand::Missing => return ComputeResult::Missing { recorded_dep_keys: vec![dep_key] },
+            Demand::Ready(v) => v,
+        };
+        let act = match dv.as_any().downcast_ref::<ConfiguredTarget>() {
+            Some(ct) => ct,
+            None => return ComputeResult::Error(Error::Invalid { what: "alias actual".into(), detail: "not a ConfiguredTarget".into() }),
+        };
+        let dep_ct_key = match decode_ct_key(dep_key.canonical()) {
+            Ok(k) => k,
+            Err(e) => return ComputeResult::Error(e),
+        };
+        // Enforce the alias→actual edge (a private `actual` in another package is a typed error, just like a
+        // normal dep edge). Uses the `actual`'s own visibility carried on its CT value.
+        if let Err(e) = check_visibility(&ctk.package, &dep_ct_key.package, &parent_label, &actual, &act.visibility) {
+            return ComputeResult::Error(e);
+        }
+        // Forward the `actual`'s providers VERBATIM — the whole point of an alias.
+        // MUTANT `mutant_alias_breaks_provider_passthrough`: drop the actual's providers → a dependent that
+        // reads a forwarded provider (e.g. `dep[RustInfo]` in rust.bzl) can no longer find it and the build
+        // fails closed. Turns the alias provider-passthrough proof RED (unfiltered).
+        let providers = if cfg!(feature = "mutant_alias_breaks_provider_passthrough") {
+            Vec::new()
+        } else {
+            act.providers.clone()
+        };
+        // Build the dep-output chaining EXACTLY as a direct dependent of `actual` would (paths a + b), so the
+        // alias is TRANSPARENT: the actual's OWN action outputs map to the actual's CT, and its transitive
+        // dep_outputs pass through with the producer CT carried verbatim. A dependent that names `actual`'s
+        // rlib as a rustc input then resolves it to the actual's generating action through the alias.
+        let mut dep_outputs: Vec<DepOutput> = Vec::new();
+        for (idx, tmpl) in act.actions.iter().enumerate() {
+            for out in &tmpl.outputs {
+                let entry = DepOutput { exec_path: out.clone(), producer_ct: dep_ct_key.clone(), action_index: idx as u32 };
+                if let Err(e) = merge_dep_output(&mut dep_outputs, entry, ctk) {
+                    return ComputeResult::Error(e);
+                }
+            }
+        }
+        for d in &act.dep_outputs {
+            if let Err(e) = merge_dep_output(&mut dep_outputs, d.clone(), ctk) {
+                return ComputeResult::Error(e);
+            }
+        }
+        ComputeResult::Ready(Arc::new(ConfiguredTarget { providers, actions: Vec::new(), dep_outputs, visibility }))
     }
 }
+
 impl NodeFunction for ConfiguredTargetFn {
     fn compute(&self, key: &NodeKey, ctx: &mut dyn DemandContext) -> ComputeResult {
         let ctk = match decode_ct_key(key.canonical()) {
@@ -293,6 +506,31 @@ impl NodeFunction for ConfiguredTargetFn {
             Some(t) => t.clone(),
             None => return ComputeResult::Error(Error::NotFound { what: "target".into(), detail: format!("//{}:{}", ctk.package, ctk.name) }),
         };
+        // (1b) `alias` — a native forwarding target (kind = "alias", no rule origin). It re-publishes the
+        // `actual` target's providers VERBATIM and threads its dep-output chaining, so a dependent sees
+        // `actual` exactly as if it depended on it directly (Bazel's alias). Language-agnostic — it forwards
+        // WHATEVER providers `actual` published (nothing here assumes rust). Handled BEFORE the rule-origin
+        // check: an alias has no impl to run.
+        if target.kind == "alias" {
+            return self.compute_alias(&ctk, &target, ctx);
+        }
+        // (1c) `config_setting` — a native decl (kind = "config_setting", no rule origin). Its CT carries a
+        // `ConfigMatchInfo` (match/no-match against the resolving configuration's constraint set + values) that
+        // a select() reads. Handled BEFORE the rule-origin check (no impl to run), like alias.
+        if target.kind == "config_setting" {
+            return match select::compute_config_match(&ctk, &target, &self.select_config) {
+                Ok(ct) => ComputeResult::Ready(Arc::new(ct)),
+                Err(e) => ComputeResult::Error(e),
+            };
+        }
+        // (1d) Resolve any `select()`-valued attrs against the target's configuration (T20 select) BEFORE dep
+        // resolution / rule eval — restart-driven over the referenced `config_setting` CTs. A target with no
+        // select is byte-identical (empty request set); the resolved attrs replace the raw selector.
+        let target = match select::resolve_target_selects(&ctk, target, &self.repos, ctx) {
+            select::SelectResolution::Ready(t) => t,
+            select::SelectResolution::Missing(keys) => return ComputeResult::Missing { recorded_dep_keys: keys },
+            select::SelectResolution::Error(e) => return ComputeResult::Error(e),
+        };
         // (2) the rule origin — a generic target() placeholder has none, and there is no impl to run: fail closed.
         let origin = match &target.origin {
             Some(o) => o.clone(),
@@ -301,6 +539,9 @@ impl NodeFunction for ConfiguredTargetFn {
                 detail: format!("//{}:{} was not instantiated by a rule()", ctk.package, ctk.name),
             }),
         };
+        // This target's own visibility (C7) — carried on the CT value so DEPENDENTS enforce the edge.
+        let visibility = target_visibility(&target);
+        let parent_label = render_label(&ctk.package, &ctk.name);
 
         // (3a) depend on the rule .bzl's CONTENT for invalidation. BZL_LOAD alone is NOT enough: its value is
         // the RuleDef (schema), which drops the impl — so an impl-only edit would cut off there and serve STALE
@@ -358,7 +599,7 @@ impl NodeFunction for ConfiguredTargetFn {
                 _ => Vec::new(),
             };
             for lbl in labels {
-                match resolve_dep(&ctk, &lbl) {
+                match resolve_dep(&ctk, &lbl, &self.repos) {
                     Ok(k) => {
                         dep_keys.push(k);
                         dep_labels.push(lbl);
@@ -380,6 +621,17 @@ impl NodeFunction for ConfiguredTargetFn {
                 Demand::Missing => missing.push(dep_keys[i].clone()),
                 Demand::Ready(v) => match v.as_any().downcast_ref::<ConfiguredTarget>() {
                     Some(ct) => {
+                        // The dep CT key (decode is total on our own encode) — used for the visibility check
+                        // AND the files-chaining below (decoded ONCE).
+                        let dep_ct_key = match decode_ct_key(dep_keys[i].canonical()) {
+                            Ok(k) => k,
+                            Err(e) => return ComputeResult::Error(e),
+                        };
+                        // (C7) enforce the cross-package visibility edge BEFORE consuming the dep — a private
+                        // cross-package dep is a typed analysis error. RED under `mutant_visibility_ignored`.
+                        if let Err(e) = check_visibility(&ctk.package, &dep_ct_key.package, &parent_label, &dep_labels[i], &ct.visibility) {
+                            return ComputeResult::Error(e);
+                        }
                         dep_providers.push(DepProviders { label: dep_labels[i].clone(), providers: ct.providers.clone() });
                         // files-chaining (MUTANT `mutant_chain_drops_dep_files` drops the whole map → a dep's
                         // declared output named as a dependent action input can no longer resolve to its
@@ -388,10 +640,6 @@ impl NodeFunction for ConfiguredTargetFn {
                         // we requested (decode is total on our own encode); a duplicate exec-path from two
                         // DISTINCT producers is a typed Conflict (fail-closed, never a silent first-wins).
                         if !cfg!(feature = "mutant_chain_drops_dep_files") {
-                            let dep_ct_key = match decode_ct_key(dep_keys[i].canonical()) {
-                                Ok(k) => k,
-                                Err(e) => return ComputeResult::Error(e),
-                            };
                             // (a) the dep's OWN declared action outputs → {this dep CT, action idx}.
                             for (idx, tmpl) in ct.actions.iter().enumerate() {
                                 for out in &tmpl.outputs {
@@ -499,8 +747,14 @@ impl NodeFunction for ConfiguredTargetFn {
             return ComputeResult::Missing { recorded_dep_keys: missing };
         }
 
-        // (6) read the rule's .bzl source (for the transient re-eval inside the seam).
-        let source = match self.sys.read(&join_root(&self.root, &RootRelativePath(origin.bzl.clone()))) {
+        // (6) read the rule's .bzl source (for the transient re-eval inside the seam). The rule .bzl is a
+        // main-repo-absolute path even for an external target's rule (the overlay loads `//rules/rust:...`),
+        // so this resolves against the workspace root — `resolve_source_path` is the uniform read choke point.
+        let bzl_host = match resolve_source_path(&self.root, &self.repos, &RootRelativePath(origin.bzl.clone())) {
+            Ok(h) => h,
+            Err(e) => return ComputeResult::Error(e),
+        };
+        let source = match self.sys.read(&bzl_host) {
             Ok(b) => match String::from_utf8(b) {
                 Ok(s) => s,
                 Err(_) => return ComputeResult::Error(Error::Invalid { what: "rule .bzl".into(), detail: "non-utf8".into() }),
@@ -508,37 +762,84 @@ impl NodeFunction for ConfiguredTargetFn {
             Err(e) => return ComputeResult::Error(Error::Invalid { what: "read rule .bzl".into(), detail: format!("{e:?}") }),
         };
 
+        // (6b) THREAD the rule .bzl's DIRECT `load()`s into evaluate_rule (row-6-adjacent analysis infra). The
+        // rule impl (`external/rules_rust/rust/private/rust.bzl`) `load()`s ~20 sibling modules; the seam
+        // re-evaluates the source, so each DIRECT load target must be supplied as an already-evaluated
+        // `BzlModule`. Each direct load is resolved (in the rule's OWN repo context — row 3) to its exec path,
+        // then requested as a BZL_LOAD node (which self-resolves ITS transitive closure) keyed under the load
+        // target's OWN repo context. A SELF-CONTAINED rule .bzl (our rust.bzl — no loads) yields an empty
+        // `loaded`, byte-identical to before. Restart-driven: an unresolved load node re-queues.
+        let rule_repo = repo_context_of(&origin.bzl);
+        let load_targets = match self.eval.load_targets(&source) {
+            Ok(t) => t,
+            Err(e) => return ComputeResult::Error(Error::Invalid { what: "rule .bzl load scan".into(), detail: format!("{e:?}") }),
+        };
+        let mut loaded_mods: Vec<(String, BzlModule)> = Vec::new();
+        let mut load_missing: Vec<NodeKey> = Vec::new();
+        for target in &load_targets {
+            let resolved = match resolve_load(&self.repos, rule_repo.as_deref(), &RootRelativePath(origin.bzl.clone()), target) {
+                Ok(p) => p,
+                Err(e) => return ComputeResult::Error(e),
+            };
+            let load_ctx = repo_context_of(&resolved.0);
+            let key = match BzlLoadKey::for_kind_in_context(resolved, LoadKind::Build { is_prelude: false }, load_ctx, self.eval.as_ref()) {
+                Ok(k) => NodeKey::from_key(&k),
+                Err(e) => return ComputeResult::Error(e),
+            };
+            match ctx.request(&key) {
+                Demand::Missing => load_missing.push(key),
+                Demand::Ready(v) => match v.as_any().downcast_ref::<BzlModuleValue>() {
+                    Some(m) => loaded_mods.push((target.clone(), m.0.clone())),
+                    None => return ComputeResult::Error(Error::Invalid { what: "BZL_LOAD value".into(), detail: format!("load '{target}' of {} was not a BzlModuleValue", origin.bzl) }),
+                },
+            }
+        }
+        if !load_missing.is_empty() {
+            return ComputeResult::Missing { recorded_dep_keys: load_missing };
+        }
+
         // (7) run the rule impl → providers (+ actions, consumed by the execution phase #5 — ignored for now),
         // with the resolved toolchains threaded in (ctx.toolchains[type]).
         // MUTANT: drop the resolved toolchains → ctx.toolchains is empty → a rule that reads one fails (G4 red).
         let tc_arg: &[ResolvedToolchain] = if cfg!(feature = "mutant_ct_drops_toolchains") { &[] } else { &toolchains };
-        let label = format!("//{}:{}", ctk.package, ctk.name);
+        // `parent_label` (computed above, repo-aware per D1: `@<repo>//<pkg>:<name>` external, `//<pkg>:<name>`
+        // internal) is the ctx.label the rule impl sees (C1 turns it into a Label object) AND the "from" side
+        // of the visibility edges enforced above.
         // The analysis re-eval runs in the SAME row-1 env the rule's .bzl was loaded in (phase-env §3).
         let env = EvalEnv::build_bzl_v1();
-        match self.eval.evaluate_rule(&env, &source, &origin.bzl, &origin.name, &[], &label, &target.attrs, &dep_providers, tc_arg) {
+        match self.eval.evaluate_rule(&env, &source, &origin.bzl, &origin.name, &loaded_mods, &parent_label, &target.attrs, &dep_providers, tc_arg) {
             Ok(result) => ComputeResult::Ready(Arc::new(ConfiguredTarget {
                 providers: result.providers,
                 actions: result.actions,
                 dep_outputs,
+                visibility,
             })),
             Err(e) => ComputeResult::Error(Error::Invalid { what: "rule evaluation".into(), detail: format!("{e:?}") }),
         }
     }
 }
 
-/// Register `CONFIGURED_TARGET` over `sys`/`root` with the given evaluator. The composition root supplies impls.
+/// Register `CONFIGURED_TARGET` over `sys`/`root` with the given evaluator. The composition root supplies impls
+/// AND the `select_config` (T20 select: the per-configuration constraint set + values the host injects for
+/// `select()`/`config_setting` resolution; empty is byte-identical to the pre-select analysis).
 pub fn register_analysis_kinds(
     engine: &mut dyn DemandEngine,
     sys: Arc<dyn System>,
     root: HostPath,
     eval: Arc<dyn BzlEvaluator>,
+    repos: ExternalRepos,
+    select_config: SelectConfig,
 ) {
-    engine.register(CONFIGURED_TARGET, Box::new(ConfiguredTargetFn::new(sys, root, eval)));
+    engine.register(
+        CONFIGURED_TARGET,
+        Box::new(ConfiguredTargetFn::new_with_repos_and_select(sys, root, eval, repos, select_config)),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use razel_source::ExternalRepo;
 
     fn ckey(pkg: &str, name: &str, cfg: Option<&str>) -> ConfiguredTargetKey {
         ConfiguredTargetKey {
@@ -568,11 +869,35 @@ mod tests {
     }
 
     #[test]
+    fn cross_package_visibility_enforced() {
+        // C7/D7: same-package edges always visible; cross-package needs `//visibility:public`; a private
+        // (default) cross-package dep is a typed error naming both; an unknown form fails closed. RED under
+        // `mutant_visibility_ignored` (which allows the private cross-package edge).
+        assert!(check_visibility("a", "a", "//a:t", "//a:dep", &[]).is_ok(), "same-package edge is always visible");
+        assert!(
+            check_visibility("a", "b", "//a:t", "//b:dep", &["//visibility:public".into()]).is_ok(),
+            "a public cross-package edge is visible"
+        );
+        assert!(
+            matches!(check_visibility("a", "b", "//a:t", "//b:dep", &[]), Err(Error::Invalid { .. })),
+            "a PRIVATE (default) cross-package dep is a typed error — RED under mutant_visibility_ignored"
+        );
+        assert!(
+            check_visibility("a", "b", "//a:t", "//b:dep", &["//visibility:private".into()]).is_err(),
+            "an explicitly-private cross-package dep also fails closed"
+        );
+        assert!(
+            matches!(check_visibility("a", "b", "//a:t", "//b:dep", &["//c:__pkg__".into()]), Err(Error::Unsupported { .. })),
+            "an unknown visibility form (package group / __pkg__) fails closed — deferred, never silently allowed"
+        );
+    }
+
+    #[test]
     fn dep_key_threads_parent_config() {
         // Anti-corner (III): the parent's configuration is THREADED into a dependency's key (identity transform
         // now; a real transition slots in here later). `mutant_ct_drops_config` regresses this → test goes red.
         let parent = ckey("pkg", "root", Some("cfg-1"));
-        let dep = resolve_dep(&parent, ":leaf").expect("same-package dep resolves");
+        let dep = resolve_dep(&parent, ":leaf", &ExternalRepos::empty()).expect("same-package dep resolves");
         let child = decode_ct_key(dep.canonical()).unwrap();
         assert_eq!(child.package, "pkg");
         assert_eq!(child.name, "leaf");
@@ -582,9 +907,45 @@ mod tests {
     #[test]
     fn dep_label_forms_fail_closed() {
         let parent = ckey("pkg", "t", None);
-        assert!(resolve_dep(&parent, ":a").is_ok(), "':name' resolves (same package)");
-        assert!(resolve_dep(&parent, "//other:b").is_ok(), "'//pkg:name' resolves (absolute)");
-        assert!(resolve_dep(&parent, "bare").is_err(), "a bare name must fail closed");
-        assert!(resolve_dep(&parent, "@repo//x:y").is_err(), "a repo label must fail closed (unsupported)");
+        let none = ExternalRepos::empty();
+        assert!(resolve_dep(&parent, ":a", &none).is_ok(), "':name' resolves (same package)");
+        assert!(resolve_dep(&parent, "//other:b", &none).is_ok(), "'//pkg:name' resolves (absolute)");
+        assert!(resolve_dep(&parent, "bare", &none).is_err(), "a bare name must fail closed");
+        // T17 external roots (D1): a DECLARED repo resolves; an UNDECLARED repo stays a typed error — the pinned
+        // rejection flips to a positive test that STILL fails closed for undeclared repos (never a fallback).
+        assert!(
+            resolve_dep(&parent, "@shape//x:y", &none).is_err(),
+            "an UNDECLARED repo label must fail closed (no workspace fallback)"
+        );
+        let declared = ExternalRepos::from_pairs([(
+            "shape".to_string(),
+            ExternalRepo { root: HostPath::new("/ext/shape"), build_file: Some(RootRelativePath("third-party/shape/BUILD.bazel".to_string())) },
+        )]);
+        let dep = resolve_dep(&parent, "@shape//x:y", &declared).expect("a DECLARED repo label resolves");
+        let ct = decode_ct_key(dep.canonical()).unwrap();
+        assert_eq!(ct.package, "@shape//x", "canonical D1 package text carries the repo marker");
+        assert_eq!(ct.name, "y");
+    }
+
+    #[test]
+    fn external_and_internal_same_suffix_packages_are_distinct_cts() {
+        // D1 distinct-identity law (guards `mutant_repo_prefix_stripped_from_package`): an external package
+        // `@shape//foo` and an internal package `foo` (colliding suffix) must produce DISTINCT CT identities
+        // (distinct package strings → distinct encoded keys). Under the mutant the `@shape//` marker is
+        // dropped, the two collide, and this goes RED.
+        let parent = ckey("razel-core", "root", None);
+        let repos = ExternalRepos::from_pairs([(
+            "shape".to_string(),
+            ExternalRepo { root: HostPath::new("/ext/shape"), build_file: Some(RootRelativePath("third-party/shape/BUILD.bazel".to_string())) },
+        )]);
+        let ext = decode_ct_key(resolve_dep(&parent, "@shape//foo:t", &repos).unwrap().canonical()).unwrap();
+        let int = decode_ct_key(resolve_dep(&parent, "//foo:t", &repos).unwrap().canonical()).unwrap();
+        assert_eq!(int.package, "foo", "internal package is the bare pkg-rel");
+        assert_ne!(ext.package, int.package, "external and internal same-suffix packages are DISTINCT (not collapsed)");
+        assert_ne!(
+            ext.encode(),
+            int.encode(),
+            "distinct CT identities → distinct encoded keys (distinct artifacts); the mutant collapses them"
+        );
     }
 }

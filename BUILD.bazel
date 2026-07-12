@@ -1,0 +1,21 @@
+# razel-analysis/BUILD.bazel — razel building its OWN configured-target/analysis crate (part of razel-daemon's
+# fat closure). Direct deps: razel-core, razel-ids, razel-engine-api, razel-os-api, razel-bzl-api,
+# razel-source, razel-load, razel-package, razel-toolchain.
+load("//rules/rust:rust.bzl", "rust_library")
+
+rust_library(
+    name = "razel_analysis",
+    srcs = ["src/lib.rs"],  # single-file crate (crate root, listed first)
+    deps = [
+        "//razel-core:razel_core",
+        "//razel-ids:razel_ids",
+        "//razel-engine-api:razel_engine_api",
+        "//razel-os-api:razel_os_api",
+        "//razel-bzl-api:razel_bzl_api",
+        "//razel-source:razel_source",
+        "//razel-load:razel_load",
+        "//razel-package:razel_package",
+        "//razel-toolchain:razel_toolchain",
+    ],
+    visibility = ["//visibility:public"],  # consumed cross-package (action, host)
+)
